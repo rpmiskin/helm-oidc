@@ -80,3 +80,16 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+
+keycloak:
+  ingress:
+    enabled: true
+    path: "/"
+    pathType: "Prefix"
+    ingressClassName: "nginx"
+    hostname: "oauth.localhost"
+    extraTls:
+      - secretName: "oauth.localhost"
+        hosts:
+          - "oauth.localhost" 

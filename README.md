@@ -324,12 +324,192 @@ ingress:
         - test.localhost
 ```
 
-If this update is applied, attempts to access https://test.localhost/main will now require a login
-via GitHub.
+If this update is applied, attempts to access https://test.localhost/main will
+now require a login via GitHub.
+
+### And now the problems start...
+
+Unfortunately logging in via GitHub caused me a 500 error. Looking in the logs showed the
+following:
+
+```
+[2022/06/26 07:19:24] [oauthproxy.go:775] Error creating session during OAuth2 callback: unexpected status "404": {"message":"Not Found","documentation_url":"https://docs.github.com/rest/reference/users#list-email-addresses-for-the-authenticated-user"}
+```
+
+Ffrom bit of poking around I _think_ this is down to an error in the GitHub provider
+with oauth2-proxy, but I am not 100% sure.
+
+I tried setting up with the default Google provider, but that cannot authorise domains
+that do not have valid TLDs (e.g. .com), so it cannot work with my local test domain.
+
+# Custom local OAuth provider
+
+As an alternative to using a public OAuth provider it should be possible to use the
+same sort of configuration with a local provider.
+
+To do this we'll create a top level helm chart so we can install/uninstall the provider
+independently of our app, and once again make use of the Bitnami charts, rather than
+rolling our own. At least initally we don't want any additional resources, so we'll create a chart, remove the default templates and update the dependencies to include keycloak.
+
+```
+helm create local-oauth
+rm local-oauth/templates/*.yaml
+```
+
+Then added the following to `Chart.yaml`:
+
+```yaml
+dependencies:
+  - name: "keycloak"
+    repository: "@bitnami"
+    version: "9.3.2"
+```
+
+The chart can then be installed by doing the following:
+
+```
+helm dep update ./local-oauth
+helm upgrade --install oauth ./local-oauth --namespace oauth --create-namespace
+```
+
+You can see what has been deployed as follows:
+
+```
+% kubectl get all --namespace oauth
+NAME                     READY   STATUS    RESTARTS   AGE
+pod/oauth-keycloak-0     1/1     Running   0          2m8s
+pod/oauth-postgresql-0   1/1     Running   0          2m8s
+
+NAME                              TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)                      AGE
+service/oauth-keycloak            LoadBalancer   10.110.195.85   <pending>     80:30490/TCP,443:32708/TCP   2m8s
+service/oauth-keycloak-headless   ClusterIP      None            <none>        80/TCP                       2m8s
+service/oauth-postgresql          ClusterIP      10.111.26.89    <none>        5432/TCP                     2m8s
+service/oauth-postgresql-hl       ClusterIP      None            <none>        5432/TCP                     2m8s
+
+NAME                                READY   AGE
+statefulset.apps/oauth-keycloak     1/1     2m8s
+statefulset.apps/oauth-postgresql   1/1     2m8s
+```
+
+(Note that I have chosen to create a new namespace for the oauth provider, this is
+purely to keep it logically separate to the rest of the system.)
+
+As you can see there are pods and services, but as yet no ingress. This can be configured via
+the values file. Additionally I'm going to use a different host for this deployment to try and
+make things a little clearer, and this will need some new certificates and add them as a secret
+
+```
+mkcert oauth.localhost
+kubectl create secret tls oauth.localhost \
+     --namespace oauth \
+     --key oauth.localhost-key.pem \
+     --cert oauth.localhost.pem
+```
+
+Then we can update `local-oauth/values.yaml` to enable the ingress with TLS.
+
+```yaml
+keycloak:
+  ingress:
+    enabled: true
+    path: "/"
+    pathType: "Prefix"
+    ingressClassName: "nginx"
+    hostname: "oauth.localhost"
+    extraTls:
+      - secretName: "oauth.localhost"
+        hosts:
+          - "oauth.localhost"
+```
+
+And now navigating to https://oauth.localhost will take us the Keycloak welcome page. By default
+the admin password is randomly generated, to get the details you can do the following:
+
+```
+kubectl get secret --namespace oauth oauth-keycloak -o yaml
+```
+
+and then base64 decode the value of `admin-password`. This can then be used to log into keycloak
+and configure things...
+
+Follow the [instructions from oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/docs/configuration/oauth_provider#keycloak-oidc-auth-provider)
+to configure a new oidc provider, update the oauth-proxy secret with the new values and change the
+values file to use the following.
+
+```yaml
+extraArgs:
+  - "--provider=keycloak-oidc"
+  - "--redirect-url=https://test.localhost/oauth2/callback"
+  - "--oidc-issuer-url=https://oauth.localhost/realms/master"
+```
+
+This can then be applied by running:
+
+```
+helm upgrade --install tst ./main-chart
+```
+
+Unfortunately all is not well. While oauth2-proxy can reach https://oauth.localhost it does not
+trust the CA. Looking in the logs shows:
+
+```
+[2022/06/26 09:08:49] [provider.go:55] Performing OIDC Discovery...
+[2022/06/26 09:08:49] [main.go:60] ERROR: Failed to initialise OAuth2 Proxy: error intiailising provider: could not create provider data: error building OIDC ProviderVerifier: could not get verifier builder: error while discovery OIDC configuration: failed to discover OIDC configuration: error performing request: Get "https://oauth.localhost/realms/master/.well-known/openid-configuration": x509: certificate signed by unknown authority
+```
+
+The cert created via `mkcert` uses it's own CA, and so we need to make our deployed apps trust it.
+`oauth2-proxy` includes an option `--provider-ca-file` that should help with this.
+You can find the location of the CA cert by running `mkcert -CAROOT`. The following commands will
+create a secret with the mkcert root CA PEM file.
+
+```
+% MKCERT_ROOT=$(mkcert -CAROOT)
+% kubectl create secret generic --from-file $MKCERT_ROOT/rootCA.pem mkcert-ca
+```
+
+We then need to mount the secret into the oauth2-proxy pod, and configure oauth2-proxy to use it.
+
+```yaml
+extraVolumeMounts:
+  - name: mkcert-ca
+    mountPath: "/opt/certs/ca"
+    readOnly: true
+extraVolumes:
+  - name: mkcert-ca
+    secret:
+      secretName: mkcert-ca
+      optional: false
+```
+
+And add an argument so that the proxy uses the mounted secret:
+
+```yaml
+extraArgs:
+  - "--provider=keycloak-oidc"
+  - "--redirect-url=https://test.localhost/oauth2/callback"
+  - "--oidc-issuer-url=https://oauth.localhost/realms/master"
+  - "--provider-ca-file=/opt/certs/ca/rootCA.pem"
+```
+
+_NOTE_ You will need to configure some users in KeyCloak. I set up a couple of test users with
+noddy passwords and email address which I marked as verified. If you do not mark these as verified
+then, as configured above, oauth2-proxy will return an unhelpful 500 error and put the following
+into the log:
+
+```
+[2022/06/26 10:05:42] [oauthproxy.go:768] Error redeeming code during OAuth2 callback: email in id_token (test3@example.com) isn't verified
+10.1.0.100:56036 - 4dba7c4ddd604349c6561e602a511ab5 - - [2022/06/26 10:05:42] test.localhost GET - "/oauth2/callback?state=3SP-tysNfZ2zJ7rShXhiqRGd4mdeJGj6JxJN_Wmma3Y%3A%2Fmain&session_state=20cabb0e-3a80-4b19-83eb-31e267a42d97&code=bbe1f4fa-f38a-4c7c-82a1-8fc0ae68a10d.20cabb0e-3a80-4b19-83eb-31e267a42d97.861952cb-aa8a-4276-8ec3-fd49e999cc6b" HTTP/1.1 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15" 500 2837 0.014
+```
+
+There is an option to allow unverifed email addresses, but in general marking them verified seems
+slightly preferable.
 
 # Future Work
 
-1. Enable OIDC at the ingress
-2. Enable OIDC at the pods via a sidecar
-3. Enable OIDC authentication of service accounts
-4. Multiple ingress controllers.
+1. Enable OIDC at the pods via a sidecar
+2. Enable OIDC authentication of service accounts
+3. Multiple ingress controllers.
+
+```
+
+```

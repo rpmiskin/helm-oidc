@@ -103,7 +103,19 @@ oauth2-proxy:
   configuration:
     existingSecret: "oauth-proxy-secret"
   extraArgs:
-    - "--provider=github"
+    - "--provider=keycloak-oidc"
+    - "--redirect-url=https://test.localhost/oauth2/callback"
+    - "--oidc-issuer-url=https://oauth.localhost/realms/master"
+    - "--provider-ca-file=/opt/certs/ca/rootCA.pem"
+  extraVolumeMounts:
+    - name: mkcert-ca
+      mountPath: "/opt/certs/ca"
+      readOnly: true
+  extraVolumes:
+    - name: mkcert-ca
+      secret: 
+        secretName: mkcert-ca
+        optional: false
   ingress:
     path: "/oauth"
     pathType: "Prefix"
