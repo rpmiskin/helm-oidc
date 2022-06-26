@@ -47,6 +47,10 @@ ingress:
     # This annotation, and the path regexes, strip off the path
     # prefix before sending to the downstream service
     nginx.ingress.kubernetes.io/rewrite-target: /$2
+    # The auth-url and auth-signin annotations ensure that connections via this
+    # ingress are forwarded to oauth2-proxy
+    nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
     name: rewrite
   hosts:
     - host: test.localhost 
@@ -94,3 +98,19 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+oauth2-proxy:
+  configuration:
+    existingSecret: "oauth-proxy-secret"
+  extraArgs:
+    - "--provider=github"
+  ingress:
+    path: "/oauth"
+    pathType: "Prefix"
+    enabled: true
+    ingressClassName: "nginx"
+    hostname: "test.localhost"
+    extraTls:
+      - secretName: "test.localhost"
+        hosts:
+          - "test.localhost" 

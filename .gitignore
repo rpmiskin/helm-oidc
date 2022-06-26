@@ -1,3 +1,7 @@
 node_modules
+# Ignore SSL certs
 *.pem
+# Ignore any secret files
 *secret.yaml
+# Ignore any packaged charts
+**/charts/*.tgz
